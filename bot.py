@@ -1,16 +1,16 @@
-import asyncio
 import json
 import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+
 
 load_dotenv()
 TOKEN = os.getenv("TOKEN") or os.getenv("DISCORD_TOKEN", "")
@@ -60,7 +60,6 @@ class VoiceRoomBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.room_states: Dict[int, RoomState] = {}
         self.control_channel_id: int = CONTROL_CHANNEL_ID
-        self.temp_tasks: Dict[Tuple[int, str], asyncio.Task] = {}
 
     async def setup_hook(self) -> None:
         self.load_state()
@@ -112,12 +111,9 @@ class VoiceRoomBot(commands.Bot):
 bot = VoiceRoomBot()
 
 
-BADGE_LABELS = {
-    "mute": "🔇 Мут",
-    "deafen": "🎧 Заглушён",
-    "stream": "📺 Стрим",
-    "camera": "📹 Камера",
-}
+def is_admin(member: discord.Member) -> bool:
+    perms = member.guild_permissions
+    return perms.administrator or perms.manage_guild or perms.move_members or perms.manage_channels
 
 
 async def safe_send(interaction: discord.Interaction, text: str, ephemeral: bool = True) -> None:
@@ -127,21 +123,11 @@ async def safe_send(interaction: discord.Interaction, text: str, ephemeral: bool
         await interaction.response.send_message(text, ephemeral=ephemeral)
 
 
-async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True) -> None:
-    if not interaction.response.is_done():
-        await interaction.response.defer(ephemeral=ephemeral)
-
-
 def trunc(text: str, limit: int = 1024) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def is_admin(member: discord.Member) -> bool:
-    perms = member.guild_permissions
-    return perms.administrator or perms.manage_guild or perms.move_members or perms.manage_channels
-
-
-def voice_badges(member: discord.Member, leader_id: int) -> List[str]:
+def format_member_line(member: discord.Member, leader_id: int) -> str:
     badges: List[str] = []
     if member.id == leader_id:
         badges.append("👑")
@@ -154,45 +140,8 @@ def voice_badges(member: discord.Member, leader_id: int) -> List[str]:
             badges.append("📺")
         if member.voice.self_video:
             badges.append("📹")
-    return badges
-
-
-def format_member_line(member: discord.Member, leader_id: int) -> str:
-    badges = " ".join(voice_badges(member, leader_id))
-    prefix = f"{badges} " if badges else ""
+    prefix = " ".join(badges) + " " if badges else ""
     return f"{prefix}{member.mention}"
-
-
-def member_status_text(member: discord.Member) -> str:
-    if not member.voice:
-        return "без статуса"
-    bits = []
-    if member.voice.mute:
-        bits.append(BADGE_LABELS["mute"])
-    if member.voice.deaf:
-        bits.append(BADGE_LABELS["deafen"])
-    if member.voice.self_stream:
-        bits.append(BADGE_LABELS["stream"])
-    if member.voice.self_video:
-        bits.append(BADGE_LABELS["camera"])
-    return " • ".join(bits) if bits else "в войсе"
-
-
-def can_manage_target(actor: discord.Member, target: discord.Member) -> bool:
-    return actor.guild_permissions.administrator or target.top_role < actor.top_role
-
-
-def parse_duration_minutes(value: str) -> Optional[int]:
-    raw = value.strip().lower()
-    if not raw:
-        return None
-    try:
-        minutes = int(raw)
-    except ValueError:
-        return None
-    if minutes < 0:
-        return None
-    return minutes
 
 
 async def get_control_channel(guild: discord.Guild, create_if_missing: bool = False) -> Optional[discord.TextChannel]:
@@ -242,61 +191,48 @@ async def get_or_create_room_state(channel: discord.VoiceChannel | discord.Stage
     return state
 
 
-def panel_colour(channel: discord.VoiceChannel | discord.StageChannel, locked: bool, humans_count: int) -> discord.Colour:
-    if humans_count == 0:
-        return discord.Colour.dark_grey()
-    if locked:
-        return discord.Colour.orange()
-    if isinstance(channel, discord.StageChannel):
-        return discord.Colour.purple()
-    return discord.Colour.blurple()
-
-
 def make_room_embed(guild: discord.Guild, channel: discord.VoiceChannel | discord.StageChannel, state: RoomState) -> discord.Embed:
     humans = [m for m in channel.members if not m.bot]
     leader = guild.get_member(state.leader_id)
     leader_text = leader.mention if leader else f"<@{state.leader_id}>"
+    member_lines = "\n".join(format_member_line(m, state.leader_id) for m in humans) or "Пусто"
     limit_text = "∞" if channel.user_limit == 0 else str(channel.user_limit)
 
     perms_everyone = channel.overwrites_for(guild.default_role)
     locked = perms_everyone.connect is False
+    status_bits = ["🔒 Закрыта" if locked else "🔓 Открыта"]
+    if isinstance(channel, discord.StageChannel):
+        status_bits.append("🎭 Stage")
+    else:
+        status_bits.append("🔊 Voice")
+
     created_ts = int(datetime.fromisoformat(state.created_at).timestamp())
-
-    member_lines = []
-    for idx, member in enumerate(humans, start=1):
-        badges = " ".join(voice_badges(member, state.leader_id))
-        prefix = f"{badges} " if badges else ""
-        member_lines.append(f"`{idx:02}` {prefix}{member.mention}")
-    members_value = "\n".join(member_lines) if member_lines else "Никого нет"
-
-    status_bits = [
-        "🔒 закрыта" if locked else "🔓 открыта",
-        f"👥 {len(humans)}/{limit_text}",
-        "🎭 stage" if isinstance(channel, discord.StageChannel) else "🔊 voice",
-    ]
-
     embed = discord.Embed(
-        title=f"✨ {channel.name}",
+        title=f"🎛️ Панель комнаты · {channel.name}",
         description=(
-            f"**Лидер:** {leader_text}\n"
-            f"**Статус:** {' • '.join(status_bits)}\n"
-            f"**Создана:** <t:{created_ts}:R>"
+            "Управление доступно лидеру комнаты или администратору.\n"
+            "Первый человек, который заходит в пустой войс, автоматически получает лидерство."
         ),
-        colour=panel_colour(channel, locked, len(humans)),
+        color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
     )
+    embed.add_field(name="👑 Лидер", value=leader_text, inline=True)
+    embed.add_field(name="👥 Участники", value=f"{len(humans)}", inline=True)
+    embed.add_field(name="🚪 Лимит", value=limit_text, inline=True)
+    embed.add_field(name="📌 Статус", value=" · ".join(status_bits), inline=False)
+    embed.add_field(name="🧑‍🤝‍🧑 Кто сейчас в комнате", value=trunc(member_lines, 1024), inline=False)
     embed.add_field(
-        name="🪄 Управление",
-        value=(
-            "Выбери действие в меню ниже или нажми одну из иконок.\n"
-            "Для модерации участника бот спросит причину и время, где это нужно."
+        name="ℹ️ Инфо",
+        value=trunc(
+            f"Канал: {channel.mention}\n"
+            f"ID: `{channel.id}`\n"
+            f"Лидер назначен: <t:{created_ts}:R>",
+            1024,
         ),
         inline=False,
     )
-    embed.add_field(name="🧑‍🤝‍🧑 Участники", value=trunc(members_value), inline=False)
-    embed.set_footer(text=f"room:{channel.id} | minimal-voice-ui")
-    if guild.icon:
-        embed.set_thumbnail(url=guild.icon.url)
+    embed.set_thumbnail(url=guild.icon.url if guild.icon else discord.Embed.Empty)
+    embed.set_footer(text=f"room:{channel.id} | Voice Control Panel")
     return embed
 
 
@@ -381,163 +317,6 @@ async def ensure_control_rights(interaction: discord.Interaction, room_channel: 
     return False
 
 
-async def schedule_voice_revert(target: discord.Member, action: str, minutes: Optional[int]) -> None:
-    if not minutes or minutes <= 0:
-        return
-    key = (target.id, action)
-    existing = bot.temp_tasks.get(key)
-    if existing and not existing.done():
-        existing.cancel()
-
-    async def worker() -> None:
-        try:
-            await asyncio.sleep(minutes * 60)
-            if action == "mute" and target.voice:
-                await target.edit(mute=False, reason="Auto unmute by voice panel timer")
-            elif action == "deafen" and target.voice:
-                await target.edit(deafen=False, reason="Auto undeafen by voice panel timer")
-            if target.voice and isinstance(target.voice.channel, (discord.VoiceChannel, discord.StageChannel)):
-                await sync_room_panel(target.voice.channel)
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            log.warning("Temp action revert failed for %s %s: %s", target.id, action, exc)
-        finally:
-            bot.temp_tasks.pop(key, None)
-
-    bot.temp_tasks[key] = asyncio.create_task(worker())
-
-
-class ActionConfigModal(discord.ui.Modal):
-    def __init__(self, room_id: int, action: str, target_id: int) -> None:
-        title_map = {
-            "kick": "⛔ Отключение из войса",
-            "mute": "🔇 Настройка мута",
-            "unmute": "🔊 Снятие мута",
-            "deafen": "🎧 Настройка заглушения",
-            "undeafen": "🎙️ Снятие заглушения",
-            "leader": "👑 Передача лидерства",
-        }
-        super().__init__(title=title_map.get(action, "Действие"), timeout=180)
-        self.room_id = room_id
-        self.action = action
-        self.target_id = target_id
-
-        reason_placeholder = {
-            "kick": "Например: шумит, мешает, рейд",
-            "mute": "Например: спам, орёт в войсе",
-            "deafen": "Например: временно убрать звук",
-            "leader": "Например: передаю владельцу комнаты",
-        }.get(action, "Необязательно")
-
-        self.reason = discord.ui.TextInput(
-            label="Причина",
-            placeholder=reason_placeholder,
-            required=False,
-            max_length=120,
-        )
-        self.add_item(self.reason)
-
-        if action in {"mute", "deafen"}:
-            self.duration = discord.ui.TextInput(
-                label="Время в минутах",
-                placeholder="Оставь пустым для бессрочно. Например: 5",
-                required=False,
-                max_length=4,
-            )
-            self.add_item(self.duration)
-        else:
-            self.duration = None
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        channel = bot.get_channel(self.room_id)
-        if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-            await safe_send(interaction, "Комната уже недоступна.")
-            return
-        if not await ensure_control_rights(interaction, channel):
-            return
-
-        actor = interaction.user
-        if not isinstance(actor, discord.Member):
-            await safe_send(interaction, "Нужно использовать это на сервере.")
-            return
-
-        target = find_member_in_channel(channel, self.target_id)
-        if not target and self.action != "leader":
-            await safe_send(interaction, "Участник уже не в этом войсе.")
-            return
-        if target and not can_manage_target(actor, target):
-            await safe_send(interaction, "Нельзя управлять участником с такой же или более высокой ролью.")
-            return
-
-        minutes = None
-        if self.duration is not None:
-            minutes = parse_duration_minutes(str(self.duration))
-            if str(self.duration).strip() and minutes is None:
-                await safe_send(interaction, "Время должно быть целым числом минут, например 5.")
-                return
-
-        reason_text = str(self.reason).strip() or "без причины"
-        audit_reason = f"Voice panel by {actor} | {self.action} | {reason_text}"
-
-        try:
-            if self.action == "kick":
-                assert target is not None
-                await target.move_to(None, reason=audit_reason)
-                result = f"⛔ {target.mention} отключён от войса. Причина: **{reason_text}**."
-            elif self.action == "mute":
-                assert target is not None
-                await target.edit(mute=True, reason=audit_reason)
-                await schedule_voice_revert(target, "mute", minutes)
-                timer_text = f" на **{minutes} мин.**" if minutes else ""
-                result = f"🔇 {target.mention} получил мут{timer_text}. Причина: **{reason_text}**."
-            elif self.action == "unmute":
-                assert target is not None
-                await target.edit(mute=False, reason=audit_reason)
-                task = bot.temp_tasks.pop((target.id, "mute"), None)
-                if task and not task.done():
-                    task.cancel()
-                result = f"🔊 С {target.mention} снят мут. Причина: **{reason_text}**."
-            elif self.action == "deafen":
-                assert target is not None
-                await target.edit(deafen=True, reason=audit_reason)
-                await schedule_voice_revert(target, "deafen", minutes)
-                timer_text = f" на **{minutes} мин.**" if minutes else ""
-                result = f"🎧 {target.mention} заглушён{timer_text}. Причина: **{reason_text}**."
-            elif self.action == "undeafen":
-                assert target is not None
-                await target.edit(deafen=False, reason=audit_reason)
-                task = bot.temp_tasks.pop((target.id, "deafen"), None)
-                if task and not task.done():
-                    task.cancel()
-                result = f"🎙️ С {target.mention} снято заглушение. Причина: **{reason_text}**."
-            elif self.action == "leader":
-                state = await get_or_create_room_state(channel)
-                if not state:
-                    await safe_send(interaction, "Не удалось получить состояние комнаты.")
-                    return
-                target = find_member_in_channel(channel, self.target_id)
-                if not target:
-                    await safe_send(interaction, "Новый лидер уже не в комнате.")
-                    return
-                state.leader_id = target.id
-                state.add_member(target.id)
-                bot.save_state()
-                result = f"👑 Лидер комнаты теперь {target.mention}. Причина: **{reason_text}**."
-            else:
-                await safe_send(interaction, "Неизвестное действие.")
-                return
-        except discord.Forbidden:
-            await safe_send(interaction, "Боту не хватает прав для этого действия.")
-            return
-        except discord.HTTPException:
-            await safe_send(interaction, "Discord отклонил это действие.")
-            return
-
-        await sync_room_panel(channel)
-        await safe_send(interaction, result)
-
-
 class MemberActionSelect(discord.ui.Select):
     def __init__(self, bot_ref: VoiceRoomBot, room_id: int, action: str, actor_id: int) -> None:
         self.bot_ref = bot_ref
@@ -546,12 +325,12 @@ class MemberActionSelect(discord.ui.Select):
         self.actor_id = actor_id
         options = self._build_options()
         placeholders = {
-            "kick": "⛔ Выбери, кого отключить",
-            "mute": "🔇 Выбери, кого замутить",
-            "unmute": "🔊 Выбери, кому снять мут",
-            "deafen": "🎧 Выбери, кого заглушить",
-            "undeafen": "🎙️ Выбери, кому снять заглушение",
-            "leader": "👑 Выбери нового лидера",
+            "kick": "Кого отключить от войса?",
+            "mute": "Кого замутить?",
+            "unmute": "С кого снять мут?",
+            "deafen": "Кого заглушить?",
+            "undeafen": "С кого снять заглушение?",
+            "leader": "Кому передать лидерство?",
         }
         super().__init__(
             placeholder=placeholders.get(action, "Выбери участника"),
@@ -570,12 +349,16 @@ class MemberActionSelect(discord.ui.Select):
         for member in channel.members:
             if member.bot or member.id == self.actor_id:
                 continue
+            description = []
+            if member.voice and member.voice.mute:
+                description.append("muted")
+            if member.voice and member.voice.deaf:
+                description.append("deafened")
             options.append(
                 discord.SelectOption(
                     label=member.display_name[:100],
                     value=str(member.id),
-                    description=member_status_text(member)[:100],
-                    emoji="👤",
+                    description=(", ".join(description) or f"ID: {member.id}")[:100],
                 )
             )
         return options[:25]
@@ -584,22 +367,73 @@ class MemberActionSelect(discord.ui.Select):
         if self.values[0] == "none":
             await safe_send(interaction, "Нет доступных участников.")
             return
+
         channel = self.bot_ref.get_channel(self.room_id)
         if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
             await safe_send(interaction, "Комната уже недоступна.")
             return
         if not await ensure_control_rights(interaction, channel):
             return
-        await interaction.response.send_modal(ActionConfigModal(self.room_id, self.action, int(self.values[0])))
+
+        actor = interaction.user
+        if not isinstance(actor, discord.Member):
+            await safe_send(interaction, "Нужно использовать это на сервере.")
+            return
+
+        target = find_member_in_channel(channel, int(self.values[0]))
+        if not target:
+            await safe_send(interaction, "Участник уже не в этом войсе.")
+            return
+        if target.top_role >= actor.top_role and not actor.guild_permissions.administrator:
+            await safe_send(interaction, "Нельзя управлять участником с такой же или более высокой ролью.")
+            return
+
+        try:
+            if self.action == "kick":
+                await target.move_to(None, reason=f"Voice panel kick by {actor}")
+                text = f"{target.mention} отключён от войса."
+            elif self.action == "mute":
+                await target.edit(mute=True, reason=f"Voice panel mute by {actor}")
+                text = f"{target.mention} получил серверный мут."
+            elif self.action == "unmute":
+                await target.edit(mute=False, reason=f"Voice panel unmute by {actor}")
+                text = f"С {target.mention} снят серверный мут."
+            elif self.action == "deafen":
+                await target.edit(deafen=True, reason=f"Voice panel deafen by {actor}")
+                text = f"{target.mention} заглушён."
+            elif self.action == "undeafen":
+                await target.edit(deafen=False, reason=f"Voice panel undeafen by {actor}")
+                text = f"С {target.mention} снято заглушение."
+            elif self.action == "leader":
+                state = await get_or_create_room_state(channel)
+                if not state:
+                    await safe_send(interaction, "Не удалось получить состояние комнаты.")
+                    return
+                state.leader_id = target.id
+                state.add_member(target.id)
+                bot.save_state()
+                text = f"Лидер комнаты теперь {target.mention}."
+            else:
+                await safe_send(interaction, "Неизвестное действие.")
+                return
+        except discord.Forbidden:
+            await safe_send(interaction, "Боту не хватает прав для этого действия.")
+            return
+        except discord.HTTPException:
+            await safe_send(interaction, "Discord отклонил это действие.")
+            return
+
+        await sync_room_panel(channel)
+        await safe_send(interaction, text)
 
 
 class MemberActionView(discord.ui.View):
     def __init__(self, bot_ref: VoiceRoomBot, room_id: int, action: str, actor_id: int) -> None:
-        super().__init__(timeout=120)
+        super().__init__(timeout=90)
         self.add_item(MemberActionSelect(bot_ref, room_id, action, actor_id))
 
 
-class LimitRoomModal(discord.ui.Modal, title="👥 Изменение лимита комнаты"):
+class LimitRoomModal(discord.ui.Modal, title="Лимит комнаты"):
     def __init__(self, room_id: int, current_limit: int) -> None:
         super().__init__(timeout=180)
         self.room_id = room_id
@@ -630,92 +464,11 @@ class LimitRoomModal(discord.ui.Modal, title="👥 Изменение лимит
         try:
             await channel.edit(user_limit=value, reason=f"Limit change by {interaction.user}")
             await sync_room_panel(channel)
-            await safe_send(interaction, f"👥 Лимит комнаты установлен: **{value}**.")
+            await safe_send(interaction, f"Лимит комнаты установлен: **{value}**.")
         except discord.Forbidden:
             await safe_send(interaction, "Боту не хватает права Manage Channels.")
         except discord.HTTPException:
             await safe_send(interaction, "Не удалось изменить лимит комнаты.")
-
-
-
-class ActionTypeSelect(discord.ui.Select):
-    def __init__(self, bot_ref: VoiceRoomBot, room_id: int = 0) -> None:
-        self.bot_ref = bot_ref
-        self.room_id = room_id
-        options = [
-            discord.SelectOption(label="Мут", value="mute", emoji="🔇", description="Выдать мут участнику"),
-            discord.SelectOption(label="Размут", value="unmute", emoji="🔊", description="Снять мут"),
-            discord.SelectOption(label="Заглушить", value="deafen", emoji="🎧", description="Выдать заглушение"),
-            discord.SelectOption(label="Снять заглушение", value="undeafen", emoji="🎙️", description="Снять заглушение"),
-            discord.SelectOption(label="Кик из войса", value="kick", emoji="⛔", description="Отключить участника"),
-            discord.SelectOption(label="Передать лидерство", value="leader", emoji="👑", description="Выбрать нового лидера"),
-            discord.SelectOption(label="Изменить лимит", value="limit", emoji="👥", description="Задать лимит комнаты"),
-            discord.SelectOption(label="Открыть / закрыть", value="lock", emoji="🔐", description="Переключить доступ"),
-        ]
-        super().__init__(
-            placeholder="Выбрать действие",
-            min_values=1,
-            max_values=1,
-            options=options,
-            row=0,
-            custom_id="room_action_type_select",
-        )
-
-    def _resolve_room_id(self, interaction: discord.Interaction) -> Optional[int]:
-        if self.room_id:
-            return self.room_id
-        embed = interaction.message.embeds[0] if interaction.message and interaction.message.embeds else None
-        if embed and embed.footer and embed.footer.text.startswith("room:"):
-            try:
-                return int(embed.footer.text.split(":", 1)[1].split("|")[0].strip())
-            except ValueError:
-                return None
-        return None
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        room_id = self._resolve_room_id(interaction)
-        channel = self.bot_ref.get_channel(room_id) if room_id else None
-        if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-            await safe_send(interaction, "Комната уже недоступна.")
-            return
-        action = self.values[0]
-        if action == "limit":
-            if not await ensure_control_rights(interaction, channel):
-                return
-            await interaction.response.send_modal(LimitRoomModal(channel.id, channel.user_limit))
-            return
-        if action == "lock":
-            if not await ensure_control_rights(interaction, channel):
-                return
-            overwrite = channel.overwrites_for(channel.guild.default_role)
-            currently_locked = overwrite.connect is False
-            overwrite.connect = None if currently_locked else False
-            try:
-                await channel.set_permissions(channel.guild.default_role, overwrite=overwrite)
-                await sync_room_panel(channel)
-                await safe_send(interaction, "🔓 Комната открыта." if currently_locked else "🔒 Комната закрыта.")
-            except discord.Forbidden:
-                await safe_send(interaction, "Боту не хватает права Manage Channels / Manage Roles.")
-            except discord.HTTPException:
-                await safe_send(interaction, "Не удалось изменить доступ к комнате.")
-            return
-
-        if not await ensure_control_rights(interaction, channel):
-            return
-
-        messages = {
-            "kick": "**Кого отключить от войса?**\nВыбери участника ниже, потом укажи причину.",
-            "mute": "**Кого замутить?**\nВыбери участника, потом укажи причину и время.",
-            "unmute": "**С кого снять мут?**\nВыбери участника ниже.",
-            "deafen": "**Кого заглушить?**\nВыбери участника, потом укажи причину и время.",
-            "undeafen": "**С кого снять заглушение?**\nВыбери участника ниже.",
-            "leader": "**Кому передать лидерство?**\nВыбери нового лидера комнаты.",
-        }
-        await interaction.response.send_message(
-            messages[action],
-            ephemeral=True,
-            view=MemberActionView(bot, channel.id, action, interaction.user.id),
-        )
 
 
 class RoomPanelView(discord.ui.View):
@@ -723,7 +476,6 @@ class RoomPanelView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot_ref = bot_ref
         self.room_id = room_id
-        self.add_item(ActionTypeSelect(bot_ref, room_id))
 
     def _resolve_room_id(self, interaction: discord.Interaction) -> Optional[int]:
         if self.room_id:
@@ -741,64 +493,77 @@ class RoomPanelView(discord.ui.View):
         channel = self.bot_ref.get_channel(room_id) if room_id else None
         return channel if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)) else None
 
-    async def _send_member_action(self, interaction: discord.Interaction, action: str, text: str) -> None:
+    @discord.ui.button(label="", style=discord.ButtonStyle.secondary, emoji="🔄", row=0, custom_id="room_refresh")
+    async def refresh_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
             await safe_send(interaction, "Комната уже недоступна.")
             return
-        if not await ensure_control_rights(interaction, channel):
-            return
-        await interaction.response.send_message(
-            text,
-            ephemeral=True,
-            view=MemberActionView(bot, channel.id, action, interaction.user.id),
-        )
+        await sync_room_panel(channel)
+        await safe_send(interaction, "Панель обновлена.")
 
-    @discord.ui.button(emoji="👑", style=discord.ButtonStyle.secondary, row=1, custom_id="room_leader_icon")
-    async def leader_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self._send_member_action(interaction, "leader", "**Выбери нового лидера комнаты.**")
-
-    @discord.ui.button(emoji="🔇", style=discord.ButtonStyle.secondary, row=1, custom_id="room_mute_icon")
-    async def mute_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self._send_member_action(interaction, "mute", "**Выбери участника для мута.**")
-
-    @discord.ui.button(emoji="⛔", style=discord.ButtonStyle.danger, row=1, custom_id="room_kick_icon")
+    @discord.ui.button(label="", style=discord.ButtonStyle.danger, emoji="⛔", row=0, custom_id="room_kick")
     async def kick_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self._send_member_action(interaction, "kick", "**Выбери участника для отключения от войса.**")
-
-    @discord.ui.button(emoji="🔐", style=discord.ButtonStyle.secondary, row=1, custom_id="room_lock_icon")
-    async def lock_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
             await safe_send(interaction, "Комната уже недоступна.")
             return
         if not await ensure_control_rights(interaction, channel):
             return
-        overwrite = channel.overwrites_for(channel.guild.default_role)
-        currently_locked = overwrite.connect is False
-        overwrite.connect = None if currently_locked else False
-        try:
-            await channel.set_permissions(channel.guild.default_role, overwrite=overwrite)
-            await sync_room_panel(channel)
-            await safe_send(interaction, "🔓 Комната открыта." if currently_locked else "🔒 Комната закрыта.")
-        except discord.Forbidden:
-            await safe_send(interaction, "Боту не хватает права Manage Channels / Manage Roles.")
-        except discord.HTTPException:
-            await safe_send(interaction, "Не удалось изменить доступ к комнате.")
+        await interaction.response.send_message("Выбери участника для отключения от войса:", ephemeral=True, view=MemberActionView(bot, channel.id, "kick", interaction.user.id))
 
-    @discord.ui.button(emoji="🎧", style=discord.ButtonStyle.secondary, row=2, custom_id="room_deafen_icon")
-    async def deafen_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self._send_member_action(interaction, "deafen", "**Выбери участника для заглушения.**")
+    @discord.ui.button(label="", style=discord.ButtonStyle.primary, emoji="🔇", row=0, custom_id="room_mute")
+    async def mute_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        await interaction.response.send_message("Выбери участника для мута:", ephemeral=True, view=MemberActionView(bot, channel.id, "mute", interaction.user.id))
 
-    @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.success, row=2, custom_id="room_unmute_icon")
+    @discord.ui.button(label="", style=discord.ButtonStyle.success, emoji="🔊", row=0, custom_id="room_unmute")
     async def unmute_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self._send_member_action(interaction, "unmute", "**Выбери участника для снятия мута.**")
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        await interaction.response.send_message("Выбери участника для снятия мута:", ephemeral=True, view=MemberActionView(bot, channel.id, "unmute", interaction.user.id))
 
-    @discord.ui.button(emoji="🎙️", style=discord.ButtonStyle.success, row=2, custom_id="room_undeafen_icon")
+    @discord.ui.button(label="", style=discord.ButtonStyle.primary, emoji="👑", row=0, custom_id="room_leader_transfer")
+    async def leader_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        await interaction.response.send_message("Выбери нового лидера комнаты:", ephemeral=True, view=MemberActionView(bot, channel.id, "leader", interaction.user.id))
+
+    @discord.ui.button(label="", style=discord.ButtonStyle.secondary, emoji="🎧", row=1, custom_id="room_deafen")
+    async def deafen_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        await interaction.response.send_message("Выбери участника для заглушения:", ephemeral=True, view=MemberActionView(bot, channel.id, "deafen", interaction.user.id))
+
+    @discord.ui.button(label="", style=discord.ButtonStyle.success, emoji="🎙️", row=1, custom_id="room_undeafen")
     async def undeafen_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self._send_member_action(interaction, "undeafen", "**Выбери участника для снятия заглушения.**")
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        await interaction.response.send_message("Выбери участника для снятия заглушения:", ephemeral=True, view=MemberActionView(bot, channel.id, "undeafen", interaction.user.id))
 
-    @discord.ui.button(emoji="👥", style=discord.ButtonStyle.secondary, row=2, custom_id="room_limit_icon")
+
+    @discord.ui.button(label="", style=discord.ButtonStyle.secondary, emoji="👥", row=1, custom_id="room_limit")
     async def limit_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -808,12 +573,33 @@ class RoomPanelView(discord.ui.View):
             return
         await interaction.response.send_modal(LimitRoomModal(channel.id, channel.user_limit))
 
+    @discord.ui.button(label="", style=discord.ButtonStyle.secondary, emoji="🔐", row=1, custom_id="room_lock_toggle")
+    async def lock_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+
+        overwrite = channel.overwrites_for(channel.guild.default_role)
+        currently_locked = overwrite.connect is False
+        overwrite.connect = None if currently_locked else False
+        try:
+            await channel.set_permissions(channel.guild.default_role, overwrite=overwrite)
+            await sync_room_panel(channel)
+            await safe_send(interaction, "Комната открыта." if currently_locked else "Комната закрыта.")
+        except discord.Forbidden:
+            await safe_send(interaction, "Боту не хватает права Manage Channels / Manage Roles.")
+        except discord.HTTPException:
+            await safe_send(interaction, "Не удалось изменить доступ к комнате.")
+
 
 @bot.event
 async def on_ready() -> None:
     log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
     for guild in bot.guilds:
-        await get_control_channel(guild, create_if_missing=True)
+        await get_control_channel(guild, create_if_missing=False)
         for voice_channel in guild.voice_channels:
             if [m for m in voice_channel.members if not m.bot]:
                 await refresh_room_state(voice_channel)
@@ -853,7 +639,7 @@ async def setup_voice_panel(interaction: discord.Interaction, channel: discord.T
         return
     bot.control_channel_id = channel.id
     bot.save_state()
-    await safe_send(interaction, f"✨ Канал панелей установлен: {channel.mention}")
+    await safe_send(interaction, f"Канал панелей установлен: {channel.mention}")
 
 
 @bot.tree.command(name="force_sync_voice_panels", description="Пересоздать панели активных войсов")
@@ -871,7 +657,7 @@ async def force_sync_voice_panels(interaction: discord.Interaction) -> None:
     for voice_channel in interaction.guild.voice_channels:
         if [m for m in voice_channel.members if not m.bot]:
             await refresh_room_state(voice_channel)
-    await safe_send(interaction, f"✨ Панели синхронизированы в {control_channel.mention}.")
+    await safe_send(interaction, f"Панели синхронизированы в {control_channel.mention}.")
 
 
 if not TOKEN:
