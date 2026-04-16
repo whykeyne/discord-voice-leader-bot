@@ -46,6 +46,7 @@ EMOJI = {
     "menu": "<:menu:1494432167646724196>",
     "lock": "<:loc:1494433095959580724>",
     "leader": "<:leader_crown:1494432117269070106>",
+    "loud": "<:hearbro:1494439457829556314>",
 }
 
 
@@ -219,19 +220,30 @@ def make_room_embed(guild: discord.Guild, channel: discord.VoiceChannel | discor
 
     perms_everyone = channel.overwrites_for(guild.default_role)
     locked = perms_everyone.connect is False
-    status_bits = [f"{EMOJI['lock']} Закрыта" if locked else f"{EMOJI['unlock']} Открыта"]
-    status_bits.append("🎭 Stage" if isinstance(channel, discord.StageChannel) else "🔊 Voice")
+    room_type = "🎭 Stage" if isinstance(channel, discord.StageChannel) else "🔊 Voice"
+    status_line = f"{EMOJI['lock']} Закрыта" if locked else f"{EMOJI['unlock']} Открыта"
 
     embed = discord.Embed(
-        title=f"{EMOJI['sparkle']}  Панель комнаты",
-        description=f"{EMOJI['menu']}  **Выбрать действие** через меню ниже.",
-        color=0x111827,
+        title=f"{EMOJI['sparkle']}  Voice Control",
+        description=(
+            f"{EMOJI['menu']}  **Выбрать действие** в меню ниже\n"
+            "━━━━━━━━━━━━━━━━\n"
+            f"{EMOJI['leader']} {EMOJI['leader']}  лидер комнаты\n"
+            f"{EMOJI['mute']} {EMOJI['mute']}  серверный мут\n"
+            f"{EMOJI['deafen']} {EMOJI['deafen']}  заглушить\n"
+            f"{EMOJI['loud']} {EMOJI['loud']}  вернуть звук\n"
+            f"{EMOJI['kick']} {EMOJI['kick']}  кик из войса\n"
+            f"{EMOJI['lock']} {EMOJI['lock']}  закрыть / открыть\n"
+            f"{EMOJI['settings']} {EMOJI['settings']}  лимит комнаты\n"
+            f"{EMOJI['sparkle']} {EMOJI['sparkle']}  обновить панель"
+        ),
+        color=0x0B1220,
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name=f"{EMOJI['leader']} Лидер", value=leader_text, inline=True)
     embed.add_field(name=f"{EMOJI['users']} Участники", value=str(len(humans)), inline=True)
     embed.add_field(name=f"{EMOJI['user']} Лимит", value=limit_text, inline=True)
-    embed.add_field(name="Статус", value=" · ".join(status_bits), inline=False)
+    embed.add_field(name="Статус", value=f"{status_line} · {room_type}", inline=False)
     embed.add_field(name=f"{EMOJI['users']} Сейчас в комнате", value=trunc(member_lines, 1024), inline=False)
     embed.add_field(name="Канал", value=channel.mention, inline=False)
     if guild.icon:
@@ -553,15 +565,15 @@ class ActionPicker(discord.ui.Select):
         self.bot_ref = bot_ref
         self.room_id = room_id
         options = [
-            discord.SelectOption(label="Кик", value="kick", description="Отключить от войса"),
-            discord.SelectOption(label="Мут", value="mute", description="Серверный мут"),
-            discord.SelectOption(label="Размут", value="unmute", description="Снять серверный мут"),
-            discord.SelectOption(label="Заглушить", value="deafen", description="Server deafen"),
-            discord.SelectOption(label="Снять заглушение", value="undeafen", description="Вернуть звук"),
-            discord.SelectOption(label="Передать лидерство", value="leader", description="Назначить нового лидера"),
+            discord.SelectOption(label="Кик", value="kick", description="Отключить участника от войса", emoji="⛔"),
+            discord.SelectOption(label="Мут", value="mute", description="Выдать серверный мут", emoji="🔇"),
+            discord.SelectOption(label="Размут", value="unmute", description="Снять серверный мут", emoji="🔊"),
+            discord.SelectOption(label="Заглушить", value="deafen", description="Полностью заглушить участника", emoji="🎧"),
+            discord.SelectOption(label="Снять заглушение", value="undeafen", description="Вернуть звук участнику", emoji="📢"),
+            discord.SelectOption(label="Передать лидерство", value="leader", description="Назначить нового лидера комнаты", emoji="👑"),
         ]
         super().__init__(
-            placeholder="Выбрать действие",
+            placeholder="Выбрать действие…",
             min_values=1,
             max_values=1,
             options=options,
@@ -606,7 +618,7 @@ class RoomPanelView(discord.ui.View):
         channel = self.bot_ref.get_channel(room_id) if room_id else None
         return channel if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)) else None
 
-    @discord.ui.button(emoji=EMOJI["leader"], style=discord.ButtonStyle.secondary, row=1, custom_id="room_leader")
+    @discord.ui.button(emoji=EMOJI["leader"], label="Лидер", style=discord.ButtonStyle.secondary, row=1, custom_id="room_leader")
     async def leader_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -616,7 +628,7 @@ class RoomPanelView(discord.ui.View):
             return
         await interaction.response.send_message("Выбери нового лидера:", ephemeral=True, view=MemberActionView(bot, channel.id, "leader", interaction.user.id))
 
-    @discord.ui.button(emoji=EMOJI["user"], style=discord.ButtonStyle.secondary, row=1, custom_id="room_user_info")
+    @discord.ui.button(emoji=EMOJI["user"], label="Кто", style=discord.ButtonStyle.secondary, row=1, custom_id="room_user_info")
     async def user_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -625,7 +637,7 @@ class RoomPanelView(discord.ui.View):
         humans = [m.mention for m in channel.members if not m.bot]
         await safe_send(interaction, "\n".join(humans) or "Пусто")
 
-    @discord.ui.button(emoji=EMOJI["users"], style=discord.ButtonStyle.secondary, row=1, custom_id="room_users")
+    @discord.ui.button(emoji=EMOJI["users"], label="Сколько", style=discord.ButtonStyle.secondary, row=1, custom_id="room_users")
     async def users_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -633,7 +645,7 @@ class RoomPanelView(discord.ui.View):
             return
         await safe_send(interaction, f"Сейчас в комнате: **{len([m for m in channel.members if not m.bot])}**")
 
-    @discord.ui.button(emoji=EMOJI["lock"], style=discord.ButtonStyle.secondary, row=1, custom_id="room_lock_toggle")
+    @discord.ui.button(emoji=EMOJI["lock"], label="Доступ", style=discord.ButtonStyle.secondary, row=1, custom_id="room_lock_toggle")
     async def lock_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -653,7 +665,7 @@ class RoomPanelView(discord.ui.View):
         except discord.HTTPException:
             await safe_send(interaction, "Не удалось изменить доступ к комнате.")
 
-    @discord.ui.button(emoji=EMOJI["settings"], style=discord.ButtonStyle.secondary, row=2, custom_id="room_limit")
+    @discord.ui.button(emoji=EMOJI["settings"], label="Лимит", style=discord.ButtonStyle.secondary, row=2, custom_id="room_limit")
     async def settings_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -663,7 +675,7 @@ class RoomPanelView(discord.ui.View):
             return
         await interaction.response.send_modal(LimitRoomModal(channel.id, channel.user_limit))
 
-    @discord.ui.button(emoji=EMOJI["sparkle"], style=discord.ButtonStyle.secondary, row=2, custom_id="room_refresh")
+    @discord.ui.button(emoji=EMOJI["sparkle"], label="Обновить", style=discord.ButtonStyle.secondary, row=2, custom_id="room_refresh")
     async def sparkle_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -672,7 +684,7 @@ class RoomPanelView(discord.ui.View):
         await sync_room_panel(channel)
         await safe_send(interaction, "Панель обновлена.")
 
-    @discord.ui.button(emoji=EMOJI["kick"], style=discord.ButtonStyle.danger, row=2, custom_id="room_kick")
+    @discord.ui.button(emoji=EMOJI["kick"], label="Кик", style=discord.ButtonStyle.danger, row=2, custom_id="room_kick")
     async def kick_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -682,7 +694,7 @@ class RoomPanelView(discord.ui.View):
             return
         await interaction.response.send_message("Выбери участника:", ephemeral=True, view=MemberActionView(bot, channel.id, "kick", interaction.user.id))
 
-    @discord.ui.button(emoji=EMOJI["mic"], style=discord.ButtonStyle.success, row=2, custom_id="room_mic")
+    @discord.ui.button(emoji=EMOJI["loud"], label="Звук", style=discord.ButtonStyle.success, row=2, custom_id="room_mic")
     async def mic_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -696,7 +708,7 @@ class RoomPanelView(discord.ui.View):
 class PlaceholderActionPicker(discord.ui.Select):
     def __init__(self) -> None:
         super().__init__(
-            placeholder="Выбрать действие",
+            placeholder="Выбрать действие…",
             min_values=1,
             max_values=1,
             options=[discord.SelectOption(label="Панель загружается", value="noop")],
