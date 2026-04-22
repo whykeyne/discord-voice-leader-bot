@@ -281,6 +281,11 @@ async def safe_send(interaction: discord.Interaction, text: str, ephemeral: bool
         await interaction.response.send_message(text, ephemeral=ephemeral)
 
 
+async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True) -> None:
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=ephemeral, thinking=False)
+
+
 def trunc(text: str, limit: int = 1024) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -875,6 +880,10 @@ class MusicAddModal(discord.ui.Modal, title="Добавить музыку"):
         except discord.Forbidden:
             await safe_send(interaction, "Боту не хватает прав на вход и разговор в войсе.")
             return
+        except Exception as exc:
+            log.exception("MusicAddModal connect failed")
+            await safe_send(interaction, f"Ошибка подключения к войсу: {type(exc).__name__}: {exc}")
+            return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         track, error = await asyncio.to_thread(extract_media, str(self.query).strip())
@@ -1023,14 +1032,18 @@ class RoomPanelView(discord.ui.View):
 
         music = bot.get_music_state(interaction.guild.id)
         music.text_channel_id = interaction.channel_id
+        await safe_defer(interaction, ephemeral=True)
         try:
             await music.connect_to(channel)
             await sync_room_panel(channel)
             await safe_send(interaction, f"🔌 Бот подключился к {channel.mention} и готов к музыке.")
         except discord.ClientException as exc:
-            await safe_send(interaction, f"Не удалось подключиться: {exc}")
+            await safe_send(interaction, f"Не удалось подключиться к войсу: {exc}")
         except discord.Forbidden:
-            await safe_send(interaction, "Боту не хватает прав на вход и разговор в войсе.")
+            await safe_send(interaction, "Боту не хватает прав Connect/Speak для этого войса.")
+        except Exception as exc:
+            log.exception("music_join_btn failed")
+            await safe_send(interaction, f"Ошибка подключения к войсу: {type(exc).__name__}: {exc}")
 
     @discord.ui.button(label="Добавить", emoji="🎵", style=discord.ButtonStyle.primary, row=3, custom_id="room_music_add")
     async def music_add_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1246,6 +1259,10 @@ async def play_command(ctx: commands.Context, *, query: str) -> None:
         return
     except discord.Forbidden:
         await ctx.reply("Боту не хватает прав на вход в войс.")
+        return
+    except Exception as exc:
+        log.exception("play_command connect failed")
+        await ctx.reply(f"Ошибка подключения к войсу: {type(exc).__name__}: {exc}")
         return
 
     music.queue.append(track)
