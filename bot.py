@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import asyncio
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -68,6 +69,13 @@ def human_duration(seconds: int) -> str:
     if hours:
         return f"{hours}:{minutes:02}:{sec:02}"
     return f"{minutes}:{sec:02}"
+
+URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def looks_like_url(value: str) -> bool:
+    return bool(URL_RE.match(value.strip()))
+
 
 
 @dataclass
@@ -1177,73 +1185,121 @@ def extract_media(query: str) -> Tuple[Optional[Track], Optional[str]]:
     if yt_dlp is None:
         return None, "Не установлен yt-dlp. Установи пакет `yt-dlp`."
 
-    ydl_opts = {
+    query = query.strip()
+    cookie_path = Path(COOKIE_FILE)
+
+    base_opts = {
         "noplaylist": True,
-        "default_search": "ytsearch1",
         "quiet": True,
         "no_warnings": True,
         "source_address": "0.0.0.0",
         "extract_flat": False,
+        "skip_download": True,
     }
 
-    cookie_path = Path(COOKIE_FILE)
     if cookie_path.exists() and cookie_path.is_file():
-        ydl_opts["cookiefile"] = str(cookie_path)
+        base_opts["cookiefile"] = str(cookie_path)
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-    except Exception as exc:
-        err_text = str(exc)
-        if "Sign in to confirm you’re not a bot" in err_text or "Use --cookies-from-browser or --cookies" in err_text:
-            return None, (
-                "YouTube запросил подтверждение. Добавь рядом с bot.py файл cookies.txt "
-                "или укажи переменную COOKIE_FILE с путём к cookies. "
-                f"Текущий путь: {COOKIE_FILE}"
-            )
-        return None, f"Не удалось получить трек: {exc}"
+    search_candidates: List[str]
+    if looks_like_url(query):
+        search_candidates = [query]
+    else:
+        # Как у типичных music-ботов: сначала YouTube поиск, потом SoundCloud, потом generic input
+        search_candidates = [
+            f"ytsearch1:{query}",
+            f"scsearch1:{query}",
+            query,
+        ]
 
-    if not info:
-        return None, "Ничего не найдено."
+    last_error: Optional[str] = None
 
-    if "entries" in info:
-        info = next((entry for entry in info["entries"] if entry), None)
+    for candidate in search_candidates:
+        ydl_opts = dict(base_opts)
+        if candidate.startswith("ytsearch"):
+            ydl_opts["default_search"] = "ytsearch1"
+        elif candidate.startswith("scsearch"):
+            ydl_opts["default_search"] = "scsearch1"
+        else:
+            ydl_opts["default_search"] = "auto"
 
-    if not info:
-        return None, "Не удалось прочитать ответ источника."
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(candidate, download=False)
+        except Exception as exc:
+            err_text = str(exc)
+            last_error = err_text
+            if "Sign in to confirm you’re not a bot" in err_text or "Use --cookies-from-browser or --cookies" in err_text:
+                # Для текстового запроса пробуем следующий источник, для прямой youtube-ссылки сразу выходим
+                if looks_like_url(query):
+                    return None, (
+                        "YouTube запросил подтверждение. Нужен рабочий cookies.txt, а на Railway YouTube всё равно может "
+                        "резать поток по IP. Для названий треков бот попробует и другие источники, но для прямой YouTube-ссылки "
+                        f"сейчас нужен COOKIE_FILE. Текущий путь: {COOKIE_FILE}"
+                    )
+                continue
+            if "Requested format is not available" in err_text:
+                # частая проблема на YouTube/Cloud без EJS или при IP-блоке; пробуем следующий источник
+                continue
+            continue
 
-    formats = info.get("formats") or []
+        if not info:
+            continue
 
-    def _fmt_score(fmt: dict) -> tuple:
-        audio_only = 1 if fmt.get("vcodec") == "none" else 0
-        has_audio = 1 if fmt.get("acodec") not in (None, "none") else 0
-        abr = float(fmt.get("abr") or fmt.get("tbr") or 0)
-        pref_ext = fmt.get("ext") in {"webm", "m4a", "mp4"}
-        protocol_penalty = 0 if fmt.get("protocol") not in {"m3u8_native", "m3u8"} else -1
-        return (audio_only, has_audio, pref_ext, protocol_penalty, abr)
+        if "entries" in info:
+            info = next((entry for entry in info["entries"] if entry and entry.get("webpage_url") or entry and entry.get("url")), None)
 
-    selected = None
-    usable_formats = [f for f in formats if f.get("url") and f.get("acodec") not in (None, "none")]
-    if usable_formats:
-        selected = max(usable_formats, key=_fmt_score)
+        if not info:
+            continue
 
-    audio_url = (selected or info).get("url")
-    webpage_url = info.get("webpage_url") or info.get("original_url") or query
-    title = info.get("title") or "Unknown title"
-    duration = int(info.get("duration") or 0)
-    thumbnail = info.get("thumbnail")
+        formats = info.get("formats") or []
 
-    if not audio_url:
-        return None, "У трека нет прямого аудио-потока."
+        def _fmt_score(fmt: dict) -> tuple:
+            has_url = 1 if fmt.get("url") else 0
+            has_audio = 1 if fmt.get("acodec") not in (None, "none") else 0
+            audio_only = 1 if fmt.get("vcodec") == "none" else 0
+            is_live_friendly = 1 if fmt.get("protocol") not in {"m3u8_native", "m3u8"} else 0
+            abr = float(fmt.get("abr") or fmt.get("tbr") or 0)
+            return (has_url, has_audio, audio_only, is_live_friendly, abr)
 
-    return Track(
-        title=title,
-        url=audio_url,
-        webpage_url=webpage_url,
-        duration=duration,
-        requester_id=0,
-        thumbnail=thumbnail,
-    ), None
+        usable_formats = [f for f in formats if f.get("url") and f.get("acodec") not in (None, "none")]
+        selected = max(usable_formats, key=_fmt_score) if usable_formats else None
+
+        audio_url = (selected or info).get("url")
+        webpage_url = info.get("webpage_url") or info.get("original_url") or candidate
+        title = info.get("title") or "Unknown title"
+        duration = int(info.get("duration") or 0)
+        thumbnail = info.get("thumbnail")
+
+        if not audio_url:
+            # если источник нашёлся, но прямого потока нет — пробуем другой источник
+            last_error = "У найденного источника нет прямого аудио-потока."
+            continue
+
+        return Track(
+            title=title,
+            url=audio_url,
+            webpage_url=webpage_url,
+            duration=duration,
+            requester_id=0,
+            thumbnail=thumbnail,
+        ), None
+
+    if last_error and "Requested format is not available" in last_error:
+        return None, (
+            "Источник найден, но YouTube/источник не отдал пригодный аудиоформат. Для Railway это часто значит, что нужен "
+            "полный yt-dlp EJS/JS runtime или что IP хоста режется. Попробуй другое название, SoundCloud-ссылку или обнови "
+            "yt-dlp до default/ejs-варианта."
+        )
+
+    if last_error and ("Sign in to confirm you’re not a bot" in last_error or "Use --cookies-from-browser or --cookies" in last_error):
+        return None, (
+            "YouTube запросил подтверждение. Добавь рядом с bot.py файл cookies.txt или укажи COOKIE_FILE. "
+            f"Текущий путь: {COOKIE_FILE}"
+        )
+
+    if last_error:
+        return None, f"Не удалось получить трек: {last_error}"
+    return None, "Ничего не найдено ни на одном источнике."
 
 
 @bot.command(name="play")
