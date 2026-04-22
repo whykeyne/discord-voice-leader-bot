@@ -2,15 +2,21 @@ import json
 import logging
 import os
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+
+try:
+    import yt_dlp
+except Exception:
+    yt_dlp = None
 
 
 load_dotenv()
@@ -19,6 +25,8 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)
 CONTROL_CHANNEL_ID = int(os.getenv("CONTROL_CHANNEL_ID", "0") or 0)
 CONTROL_CHANNEL_NAME = os.getenv("CONTROL_CHANNEL_NAME", "voice-control")
 STATE_FILE = Path(os.getenv("STATE_FILE", "panel_state.json"))
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
+DEFAULT_VOLUME = float(os.getenv("DEFAULT_VOLUME", "0.55") or 0.55)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,8 +38,8 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.voice_states = True
+intents.message_content = True
 
-# exactly with the names user provided
 EMOJI = {
     "users": "<:users:1494432452557406368>",
     "user": "<:user:1494432427056304438>",
@@ -48,6 +56,16 @@ EMOJI = {
     "leader": "<:leader_crown:1494432117269070106>",
     "loud": "<:hearbro:1494439457829556314>",
 }
+
+
+def human_duration(seconds: int) -> str:
+    if seconds <= 0:
+        return "LIVE"
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02}:{sec:02}"
+    return f"{minutes}:{sec:02}"
 
 
 @dataclass
@@ -74,12 +92,121 @@ class RoomState:
         return present_ids[0] if present_ids else None
 
 
+@dataclass
+class Track:
+    title: str
+    url: str
+    webpage_url: str
+    duration: int
+    requester_id: int
+    thumbnail: Optional[str] = None
+
+
+class GuildMusicState:
+    def __init__(self, bot_ref: "VoiceRoomBot", guild_id: int) -> None:
+        self.bot_ref = bot_ref
+        self.guild_id = guild_id
+        self.queue: Deque[Track] = deque()
+        self.current: Optional[Track] = None
+        self.volume: float = DEFAULT_VOLUME
+        self.text_channel_id: Optional[int] = None
+        self.lock = asyncio.Lock()
+        self.is_looping: bool = False
+
+    def get_voice_client(self) -> Optional[discord.VoiceClient]:
+        guild = self.bot_ref.get_guild(self.guild_id)
+        return guild.voice_client if guild else None
+
+    def queue_preview(self, limit: int = 5) -> str:
+        if not self.queue:
+            return "Очередь пустая"
+        lines = []
+        for i, track in enumerate(list(self.queue)[:limit], start=1):
+            lines.append(f"`{i}.` {track.title} · `{human_duration(track.duration)}`")
+        if len(self.queue) > limit:
+            lines.append(f"… и ещё **{len(self.queue) - limit}**")
+        return "\n".join(lines)
+
+    async def connect_to(self, voice_channel: discord.VoiceChannel | discord.StageChannel) -> discord.VoiceClient:
+        existing = self.get_voice_client()
+        if existing and existing.is_connected():
+            if existing.channel != voice_channel:
+                await existing.move_to(voice_channel)
+            return existing
+        return await voice_channel.connect()
+
+    async def stop(self) -> None:
+        vc = self.get_voice_client()
+        self.queue.clear()
+        self.current = None
+        if vc and vc.is_connected():
+            vc.stop()
+            await vc.disconnect(force=True)
+
+    async def skip(self) -> bool:
+        vc = self.get_voice_client()
+        if vc and vc.is_playing():
+            vc.stop()
+            return True
+        return False
+
+    async def play_next(self) -> None:
+        async with self.lock:
+            vc = self.get_voice_client()
+            if not vc or not vc.is_connected():
+                self.current = None
+                return
+
+            if self.is_looping and self.current:
+                self.queue.appendleft(self.current)
+
+            if not self.queue:
+                self.current = None
+                return
+
+            track = self.queue.popleft()
+            self.current = track
+
+            source = discord.PCMVolumeTransformer(
+                discord.FFmpegPCMAudio(track.url, executable=FFMPEG_PATH, before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"),
+                volume=self.volume,
+            )
+
+            def after_play(error: Optional[Exception]) -> None:
+                if error:
+                    log.warning("Player error in guild %s: %s", self.guild_id, error)
+                self.bot_ref.loop.create_task(self.play_next())
+
+            vc.play(source, after=after_play)
+            await self.announce_now_playing(track)
+
+    async def announce_now_playing(self, track: Track) -> None:
+        channel = self.bot_ref.get_channel(self.text_channel_id) if self.text_channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            return
+        embed = discord.Embed(
+            title=f"{EMOJI['loud']} Сейчас играет",
+            description=f"**{track.title}**\nДлительность: `{human_duration(track.duration)}`",
+            color=0x111827,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Громкость", value=f"`{int(self.volume * 100)}%`", inline=True)
+        embed.add_field(name="В очереди", value=f"`{len(self.queue)}`", inline=True)
+        if track.thumbnail:
+            embed.set_thumbnail(url=track.thumbnail)
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException:
+            pass
+
+
 class VoiceRoomBot(commands.Bot):
     def __init__(self) -> None:
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.room_states: Dict[int, RoomState] = {}
         self.control_channel_id: int = CONTROL_CHANNEL_ID
         self.temp_actions: Dict[int, Dict[str, object]] = {}
+        self.music_states: Dict[int, GuildMusicState] = {}
 
     async def setup_hook(self) -> None:
         self.load_state()
@@ -92,6 +219,13 @@ class VoiceRoomBot(commands.Bot):
         else:
             await self.tree.sync()
             log.info("Synced commands globally")
+
+    def get_music_state(self, guild_id: int) -> GuildMusicState:
+        state = self.music_states.get(guild_id)
+        if state is None:
+            state = GuildMusicState(self, guild_id)
+            self.music_states[guild_id] = state
+        return state
 
     def save_state(self) -> None:
         payload = {
@@ -176,7 +310,8 @@ async def get_control_channel(guild: discord.Guild, create_if_missing: bool = Fa
         bot.save_state()
         return named
 
-    if create_if_missing and guild.me and guild.me.guild_permissions.manage_channels:
+    me = guild.me or guild.guild_permissions
+    if create_if_missing and getattr(me, "guild_permissions", None) and guild.me.guild_permissions.manage_channels:
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_messages=True),
@@ -223,28 +358,29 @@ def make_room_embed(guild: discord.Guild, channel: discord.VoiceChannel | discor
     status_text = f"{EMOJI['lock']} Закрыта" if locked else f"{EMOJI['unlock']} Открыта"
     type_text = "Stage" if isinstance(channel, discord.StageChannel) else "Voice"
 
+    music_state = bot.get_music_state(guild.id)
+    now_playing = music_state.current.title if music_state.current else "Ничего не играет"
+    queue_size = len(music_state.queue)
+
     embed = discord.Embed(
-        title=f"{EMOJI['sparkle']}  {EMOJI['sparkle']}  ПАНЕЛЬ КОМНАТЫ",
+        title=f"{EMOJI['sparkle']} CRYPTA VOICE CONTROL",
         description=(
-            f"{EMOJI['menu']}  Выбрать действие — меню сверху\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            f"{EMOJI['leader']} {EMOJI['leader']} — передать лидерство\n"
-            f"{EMOJI['mute']} {EMOJI['mute']} — серверный мут\n"
-            f"{EMOJI['deafen']} {EMOJI['deafen']} — заглушить\n"
-            f"{EMOJI['loud']} {EMOJI['loud']} — вернуть звук\n"
-            f"{EMOJI['kick']} {EMOJI['kick']} — отключить от войса\n"
-            f"{EMOJI['lock']} {EMOJI['lock']} — закрыть комнату\n"
-            f"{EMOJI['unlock']} {EMOJI['unlock']} — открыть комнату\n"
-            f"{EMOJI['users']} {EMOJI['users']} — посмотреть лимит\n"
+            "```ansi\n"
+            "\u001b[1;35mНовая панель управления комнатой\u001b[0m\n"
+            "\u001b[2;37mЛидер управляет войсом, лимитом и быстрыми действиями\u001b[0m\n"
+            "```\n"
+            f"{EMOJI['menu']} Выбирай действие в меню или кнопками ниже.\n"
+            f"{EMOJI['mic']} Музыка: `!play`, `!skip`, `!stop`, `!queue`, `!pause`, `!resume`, `!volume`"
         ),
-        color=0x0B1220,
+        color=0x0F172A,
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name=f"{EMOJI['leader']} Лидер", value=leader_text, inline=True)
-    embed.add_field(name=f"{EMOJI['users']} Участники", value=str(len(humans)), inline=True)
-    embed.add_field(name=f"{EMOJI['user']} Лимит", value=limit_text, inline=True)
-    embed.add_field(name=f"{EMOJI['menu']} Статус", value=f"{status_text} · {type_text}", inline=False)
-    embed.add_field(name=f"{EMOJI['users']} Сейчас в комнате", value=trunc(member_lines, 1024), inline=False)
+    embed.add_field(name=f"{EMOJI['users']} Люди", value=str(len(humans)), inline=True)
+    embed.add_field(name=f"{EMOJI['settings']} Лимит", value=limit_text, inline=True)
+    embed.add_field(name=f"{EMOJI['lock']} Статус комнаты", value=f"{status_text} · {type_text}", inline=False)
+    embed.add_field(name=f"{EMOJI['users']} Состав", value=trunc(member_lines, 1024), inline=False)
+    embed.add_field(name=f"{EMOJI['loud']} Музыка", value=trunc(f"Сейчас: **{now_playing}**\nОчередь: **{queue_size}**", 1024), inline=False)
     embed.add_field(name=f"{EMOJI['settings']} Канал", value=channel.mention, inline=False)
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
@@ -252,7 +388,7 @@ def make_room_embed(guild: discord.Guild, channel: discord.VoiceChannel | discor
     return embed
 
 
-async def sync_room_panel(channel: discord.VoiceChannel | discord.StageChannel) -> None:
+async def sync_room_panel(channel: discord.VoiceChannel | discord.StageChannel, force_repost: bool = False) -> None:
     state = await get_or_create_room_state(channel)
     control_channel = await get_control_channel(channel.guild, create_if_missing=True)
     if not state or not control_channel:
@@ -269,9 +405,14 @@ async def sync_room_panel(channel: discord.VoiceChannel | discord.StageChannel) 
             message = None
 
     try:
-        if message:
+        if message and not force_repost:
             await message.edit(content=None, embed=embed, view=view)
         else:
+            if message:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
             msg = await control_channel.send(embed=embed, view=view)
             state.panel_message_id = msg.id
             bot.save_state()
@@ -303,9 +444,11 @@ async def refresh_room_state(channel: discord.VoiceChannel | discord.StageChanne
     state = await get_or_create_room_state(channel)
     if not state:
         return None
+
+    old_leader = state.leader_id
     state.leader_id = state.pick_next_leader([m.id for m in humans]) or humans[0].id
     bot.save_state()
-    await sync_room_panel(channel)
+    await sync_room_panel(channel, force_repost=old_leader != state.leader_id)
     return state.leader_id
 
 
@@ -375,7 +518,7 @@ class MemberActionSelect(discord.ui.Select):
                     label=member.display_name[:100],
                     value=str(member.id),
                     description=(", ".join(description) or f"ID: {member.id}")[:100],
-                    emoji=EMOJI["user"],
+                    emoji="👤",
                 )
             )
         return options[:25]
@@ -426,10 +569,14 @@ class MemberActionSelect(discord.ui.Select):
                 if not state:
                     await safe_send(interaction, "Не удалось получить состояние комнаты.")
                     return
+                changed = state.leader_id != target.id
                 state.leader_id = target.id
                 state.add_member(target.id)
                 bot.save_state()
+                await sync_room_panel(channel, force_repost=changed)
                 text = f"{EMOJI['leader']} Лидер комнаты теперь {target.mention}."
+                await safe_send(interaction, text)
+                return
             else:
                 await safe_send(interaction, "Неизвестное действие.")
                 return
@@ -559,12 +706,12 @@ class ActionPicker(discord.ui.Select):
         self.bot_ref = bot_ref
         self.room_id = room_id
         options = [
-            discord.SelectOption(label="Кик", value="kick", description="Отключить от войса", emoji=EMOJI["kick"]),
-            discord.SelectOption(label="Мут", value="mute", description="Серверный мут", emoji=EMOJI["mute"]),
-            discord.SelectOption(label="Размут", value="unmute", description="Снять серверный мут", emoji=EMOJI["loud"]),
-            discord.SelectOption(label="Заглушить", value="deafen", description="Полностью заглушить", emoji=EMOJI["deafen"]),
-            discord.SelectOption(label="Снять заглушение", value="undeafen", description="Вернуть звук", emoji=EMOJI["undeafen"]),
-            discord.SelectOption(label="Передать лидерство", value="leader", description="Назначить нового лидера", emoji=EMOJI["leader"]),
+            discord.SelectOption(label="Кик", value="kick", description="Отключить от войса", emoji="🚪"),
+            discord.SelectOption(label="Мут", value="mute", description="Серверный мут", emoji="🔇"),
+            discord.SelectOption(label="Размут", value="unmute", description="Снять серверный мут", emoji="🔊"),
+            discord.SelectOption(label="Заглушить", value="deafen", description="Полностью заглушить", emoji="🎧"),
+            discord.SelectOption(label="Снять заглушение", value="undeafen", description="Вернуть звук", emoji="🎶"),
+            discord.SelectOption(label="Передать лидерство", value="leader", description="Назначить нового лидера", emoji="👑"),
         ]
         super().__init__(
             placeholder="Выбрать действие",
@@ -595,7 +742,7 @@ class PlaceholderActionPicker(discord.ui.Select):
             placeholder="Выбрать действие",
             min_values=1,
             max_values=1,
-            options=[discord.SelectOption(label="Панель загружается", value="noop", emoji=EMOJI["menu"])],
+            options=[discord.SelectOption(label="Панель загружается", value="noop", emoji="⌛")],
             custom_id="action_picker:placeholder",
             disabled=True,
             row=0,
@@ -663,7 +810,7 @@ class RoomPanelView(discord.ui.View):
         channel = self.bot_ref.get_channel(room_id) if room_id else None
         return channel if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)) else None
 
-    @discord.ui.button(label="Лидер", emoji=EMOJI["leader"], style=discord.ButtonStyle.secondary, row=1, custom_id="room_leader")
+    @discord.ui.button(label="Лидер", emoji="👑", style=discord.ButtonStyle.secondary, row=1, custom_id="room_leader")
     async def leader_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -677,7 +824,7 @@ class RoomPanelView(discord.ui.View):
             view=MemberActionView(bot, channel.id, "leader", interaction.user.id),
         )
 
-    @discord.ui.button(label="Участник", emoji=EMOJI["user"], style=discord.ButtonStyle.secondary, row=1, custom_id="room_user_info")
+    @discord.ui.button(label="Состав", emoji="👤", style=discord.ButtonStyle.secondary, row=1, custom_id="room_user_info")
     async def user_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -686,7 +833,7 @@ class RoomPanelView(discord.ui.View):
         humans = [m.mention for m in channel.members if not m.bot]
         await safe_send(interaction, "\n".join(humans) or "Пусто")
 
-    @discord.ui.button(label="Онлайн", emoji=EMOJI["users"], style=discord.ButtonStyle.secondary, row=1, custom_id="room_users")
+    @discord.ui.button(label="Онлайн", emoji="👥", style=discord.ButtonStyle.secondary, row=1, custom_id="room_users")
     async def users_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -694,7 +841,7 @@ class RoomPanelView(discord.ui.View):
             return
         await safe_send(interaction, f"{EMOJI['users']} Сейчас в комнате: **{len([m for m in channel.members if not m.bot])}**")
 
-    @discord.ui.button(label="Доступ", emoji=EMOJI["lock"], style=discord.ButtonStyle.secondary, row=1, custom_id="room_lock_toggle")
+    @discord.ui.button(label="Доступ", emoji="🔒", style=discord.ButtonStyle.secondary, row=1, custom_id="room_lock_toggle")
     async def lock_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -714,7 +861,7 @@ class RoomPanelView(discord.ui.View):
         except discord.HTTPException:
             await safe_send(interaction, "Не удалось изменить доступ к комнате.")
 
-    @discord.ui.button(label="Лимит", emoji=EMOJI["settings"], style=discord.ButtonStyle.secondary, row=2, custom_id="room_limit")
+    @discord.ui.button(label="Лимит", emoji="⚙️", style=discord.ButtonStyle.secondary, row=2, custom_id="room_limit")
     async def settings_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -724,7 +871,7 @@ class RoomPanelView(discord.ui.View):
             return
         await interaction.response.send_modal(LimitRoomModal(channel.id, channel.user_limit))
 
-    @discord.ui.button(label="Обновить", emoji=EMOJI["sparkle"], style=discord.ButtonStyle.secondary, row=2, custom_id="room_refresh")
+    @discord.ui.button(label="Обновить", emoji="✨", style=discord.ButtonStyle.secondary, row=2, custom_id="room_refresh")
     async def sparkle_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -733,7 +880,7 @@ class RoomPanelView(discord.ui.View):
         await sync_room_panel(channel)
         await safe_send(interaction, f"{EMOJI['sparkle']} Панель обновлена.")
 
-    @discord.ui.button(label="Кик", emoji=EMOJI["kick"], style=discord.ButtonStyle.danger, row=2, custom_id="room_kick")
+    @discord.ui.button(label="Кик", emoji="🚪", style=discord.ButtonStyle.danger, row=2, custom_id="room_kick")
     async def kick_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -743,7 +890,7 @@ class RoomPanelView(discord.ui.View):
             return
         await interaction.response.send_message("Выбери участника:", ephemeral=True, view=MemberActionView(bot, channel.id, "kick", interaction.user.id))
 
-    @discord.ui.button(label="Звук", emoji=EMOJI["loud"], style=discord.ButtonStyle.success, row=2, custom_id="room_sound_restore")
+    @discord.ui.button(label="Звук", emoji="🎶", style=discord.ButtonStyle.success, row=2, custom_id="room_sound_restore")
     async def sound_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
@@ -779,12 +926,15 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if after.channel and before.channel != after.channel:
         state = await get_or_create_room_state(after.channel)
         if state:
+            old_leader = state.leader_id
             state.add_member(member.id)
             humans = [m for m in after.channel.members if not m.bot]
             if len(humans) == 1:
                 state.leader_id = member.id
             bot.save_state()
-        await sync_room_panel(after.channel)
+            await sync_room_panel(after.channel, force_repost=(old_leader != state.leader_id))
+        else:
+            await sync_room_panel(after.channel)
 
     if after.channel and before.channel == after.channel:
         await sync_room_panel(after.channel)
@@ -817,6 +967,211 @@ async def force_sync_voice_panels(interaction: discord.Interaction) -> None:
         if [m for m in voice_channel.members if not m.bot]:
             await refresh_room_state(voice_channel)
     await safe_send(interaction, f"Панели синхронизированы в {control_channel.mention}.")
+
+
+def extract_media(query: str) -> Tuple[Optional[Track], Optional[str]]:
+    if yt_dlp is None:
+        return None, "Не установлен yt-dlp. Установи пакет `yt-dlp`."
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "default_search": "ytsearch1",
+        "quiet": True,
+        "no_warnings": True,
+        "source_address": "0.0.0.0",
+        "extract_flat": False,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+    except Exception as exc:
+        return None, f"Не удалось получить трек: {exc}"
+
+    if not info:
+        return None, "Ничего не найдено."
+
+    if "entries" in info:
+        info = next((entry for entry in info["entries"] if entry), None)
+
+    if not info:
+        return None, "Не удалось прочитать ответ источника."
+
+    audio_url = info.get("url")
+    webpage_url = info.get("webpage_url") or info.get("original_url") or query
+    title = info.get("title") or "Unknown title"
+    duration = int(info.get("duration") or 0)
+    thumbnail = info.get("thumbnail")
+
+    if not audio_url:
+        return None, "У трека нет прямого аудио-потока."
+
+    return Track(
+        title=title,
+        url=audio_url,
+        webpage_url=webpage_url,
+        duration=duration,
+        requester_id=0,
+        thumbnail=thumbnail,
+    ), None
+
+
+@bot.command(name="play")
+async def play_command(ctx: commands.Context, *, query: str) -> None:
+    if not ctx.guild or not isinstance(ctx.author, discord.Member):
+        return
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.reply("Сначала зайди в голосовой канал.")
+        return
+
+    music = bot.get_music_state(ctx.guild.id)
+    music.text_channel_id = ctx.channel.id
+
+    async with ctx.typing():
+        track, error = await asyncio.to_thread(extract_media, query)
+
+    if error or not track:
+        await ctx.reply(error or "Не удалось загрузить трек.")
+        return
+
+    track.requester_id = ctx.author.id
+
+    try:
+        await music.connect_to(ctx.author.voice.channel)
+    except discord.ClientException as exc:
+        await ctx.reply(f"Не удалось подключиться к войсу: {exc}")
+        return
+    except discord.Forbidden:
+        await ctx.reply("Боту не хватает прав на вход в войс.")
+        return
+
+    music.queue.append(track)
+
+    embed = discord.Embed(
+        title=f"{EMOJI['mic']} Трек добавлен",
+        description=f"**{track.title}**\n`{human_duration(track.duration)}`",
+        color=0x111827,
+    )
+    embed.add_field(name="Очередь", value=f"`{len(music.queue)}`", inline=True)
+    embed.add_field(name="Запросил", value=ctx.author.mention, inline=True)
+    if track.thumbnail:
+        embed.set_thumbnail(url=track.thumbnail)
+    await ctx.reply(embed=embed)
+
+    vc = music.get_voice_client()
+    if vc and not vc.is_playing() and not vc.is_paused() and music.current is None:
+        await music.play_next()
+
+    if ctx.author.voice and isinstance(ctx.author.voice.channel, (discord.VoiceChannel, discord.StageChannel)):
+        await sync_room_panel(ctx.author.voice.channel)
+
+
+@bot.command(name="skip")
+async def skip_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        return
+    music = bot.get_music_state(ctx.guild.id)
+    if await music.skip():
+        await ctx.reply("Текущий трек пропущен.")
+    else:
+        await ctx.reply("Сейчас ничего не играет.")
+
+
+@bot.command(name="stop")
+async def stop_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        return
+    music = bot.get_music_state(ctx.guild.id)
+    await music.stop()
+    await ctx.reply("Музыка остановлена, очередь очищена.")
+
+
+@bot.command(name="pause")
+async def pause_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        return
+    vc = ctx.guild.voice_client
+    if vc and vc.is_playing():
+        vc.pause()
+        await ctx.reply("Музыка на паузе.")
+    else:
+        await ctx.reply("Сейчас нечего ставить на паузу.")
+
+
+@bot.command(name="resume")
+async def resume_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        return
+    vc = ctx.guild.voice_client
+    if vc and vc.is_paused():
+        vc.resume()
+        await ctx.reply("Продолжаю проигрывание.")
+    else:
+        await ctx.reply("Музыка не стоит на паузе.")
+
+
+@bot.command(name="queue")
+async def queue_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        return
+    music = bot.get_music_state(ctx.guild.id)
+    embed = discord.Embed(
+        title=f"{EMOJI['users']} Музыкальная очередь",
+        description=music.queue_preview(),
+        color=0x111827,
+    )
+    if music.current:
+        embed.add_field(name="Сейчас играет", value=music.current.title, inline=False)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="volume")
+async def volume_command(ctx: commands.Context, percent: int) -> None:
+    if not ctx.guild:
+        return
+    if not 1 <= percent <= 200:
+        await ctx.reply("Громкость должна быть от 1 до 200.")
+        return
+    music = bot.get_music_state(ctx.guild.id)
+    music.volume = percent / 100
+    vc = music.get_voice_client()
+    if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
+        vc.source.volume = music.volume
+    await ctx.reply(f"Громкость установлена на **{percent}%**.")
+
+
+@bot.command(name="loop")
+async def loop_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        return
+    music = bot.get_music_state(ctx.guild.id)
+    music.is_looping = not music.is_looping
+    await ctx.reply(f"Повтор трека: **{'включён' if music.is_looping else 'выключен'}**.")
+
+
+@bot.command(name="musichelp")
+async def musichelp_command(ctx: commands.Context) -> None:
+    embed = discord.Embed(
+        title=f"{EMOJI['menu']} Команды музыки",
+        description=(
+            "`!play название или ссылка` — включить музыку\n"
+            "`!skip` — скипнуть трек\n"
+            "`!stop` — стоп и очистка очереди\n"
+            "`!pause` — пауза\n"
+            "`!resume` — продолжить\n"
+            "`!queue` — посмотреть очередь\n"
+            "`!volume 1-200` — громкость\n"
+            "`!loop` — повтор текущего трека"
+        ),
+        color=0x111827,
+    )
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="panel")
+async def panel_help(ctx: commands.Context) -> None:
+    await ctx.reply("Панель войса создаётся автоматически, когда в канал заходит первый человек.")
 
 
 if not TOKEN:
