@@ -29,6 +29,7 @@ STATE_FILE = Path(os.getenv("STATE_FILE", "panel_state.json"))
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 DEFAULT_VOLUME = float(os.getenv("DEFAULT_VOLUME", "0.55") or 0.55)
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.txt")
+MUSIC_CHANNEL_ID = int(os.getenv("MUSIC_CHANNEL_ID", "0") or 0)
 
 
 logging.basicConfig(
@@ -120,6 +121,7 @@ class GuildMusicState:
         self.current: Optional[Track] = None
         self.volume: float = DEFAULT_VOLUME
         self.text_channel_id: Optional[int] = None
+        self.announce_channel_id: Optional[int] = MUSIC_CHANNEL_ID or None
         self.lock = asyncio.Lock()
         self.is_looping: bool = False
 
@@ -190,8 +192,13 @@ class GuildMusicState:
             vc.play(source, after=after_play)
             await self.announce_now_playing(track)
 
+    def get_announce_channel(self) -> Optional[discord.TextChannel]:
+        target_id = self.announce_channel_id or self.text_channel_id
+        channel = self.bot_ref.get_channel(target_id) if target_id else None
+        return channel if isinstance(channel, discord.TextChannel) else None
+
     async def announce_now_playing(self, track: Track) -> None:
-        channel = self.bot_ref.get_channel(self.text_channel_id) if self.text_channel_id else None
+        channel = self.get_announce_channel()
         if not isinstance(channel, discord.TextChannel):
             return
         requester = f"<@{track.requester_id}>" if track.requester_id else "Неизвестно"
@@ -431,7 +438,7 @@ def make_room_embed(guild: discord.Guild, channel: discord.VoiceChannel | discor
         value=(
             "`Лидер` • `Состав` • `Онлайн` • `Доступ`\n"
             "`Лимит` • `Обновить` • `Кик` • `Звук`\n"
-            "`Подключить` • `Добавить` • `Пауза` • `Скип` • `Стоп`"
+            "`Подключить` • `Добавить` • `Пауза` • `Скип` • `Стоп`\n`Канал муз.` • `Очередь` • `Loop`"
         ),
         inline=False,
     )
@@ -529,6 +536,30 @@ async def ensure_control_rights(interaction: discord.Interaction, room_channel: 
         return True
     await safe_send(interaction, "У тебя нет прав на управление этой комнатой.")
     return False
+
+
+def get_music_announce_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    music = bot.get_music_state(guild.id)
+    channel = bot.get_channel(music.announce_channel_id) if music.announce_channel_id else None
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+class SafeView(discord.ui.View):
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        log.exception("View interaction failed: %s", error)
+        try:
+            await safe_send(interaction, f"Ошибка взаимодействия: {type(error).__name__}: {error}")
+        except Exception:
+            pass
+
+
+class SafeModal(discord.ui.Modal):
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Modal interaction failed: %s", error)
+        try:
+            await safe_send(interaction, f"Ошибка взаимодействия: {type(error).__name__}: {error}")
+        except Exception:
+            pass
 
 
 class MemberActionSelect(discord.ui.Select):
@@ -646,13 +677,13 @@ class MemberActionSelect(discord.ui.Select):
         await safe_send(interaction, text)
 
 
-class MemberActionView(discord.ui.View):
+class MemberActionView(SafeView):
     def __init__(self, bot_ref: VoiceRoomBot, room_id: int, action: str, actor_id: int) -> None:
         super().__init__(timeout=90)
         self.add_item(MemberActionSelect(bot_ref, room_id, action, actor_id))
 
 
-class ActionReasonModal(discord.ui.Modal):
+class ActionReasonModal(SafeModal):
     def __init__(self, action: str, target_name: str) -> None:
         super().__init__(title=f"{target_name} · {action}", timeout=180)
         self.reason = discord.ui.TextInput(
@@ -804,7 +835,7 @@ class PlaceholderActionPicker(discord.ui.Select):
         )
 
 
-class LimitRoomModal(discord.ui.Modal, title="Лимит комнаты"):
+class LimitRoomModal(SafeModal, title="Лимит комнаты"):
     def __init__(self, room_id: int, current_limit: int) -> None:
         super().__init__(timeout=180)
         self.room_id = room_id
@@ -844,7 +875,7 @@ class LimitRoomModal(discord.ui.Modal, title="Лимит комнаты"):
 
 
 
-class MusicAddModal(discord.ui.Modal, title="Добавить музыку"):
+class MusicAddModal(SafeModal, title="Добавить музыку"):
     def __init__(self, room_id: int) -> None:
         super().__init__(timeout=180)
         self.room_id = room_id
@@ -871,7 +902,10 @@ class MusicAddModal(discord.ui.Modal, title="Добавить музыку"):
             return
 
         music = bot.get_music_state(interaction.guild.id)
-        music.text_channel_id = interaction.channel_id
+        if not music.text_channel_id:
+            music.text_channel_id = interaction.channel_id
+        if not music.announce_channel_id:
+            music.announce_channel_id = interaction.channel_id
 
         if not member.voice or member.voice.channel != channel:
             await safe_send(interaction, "Нужно быть именно в этой комнате.")
@@ -905,7 +939,7 @@ class MusicAddModal(discord.ui.Modal, title="Добавить музыку"):
             ephemeral=True,
         )
 
-class RoomPanelView(discord.ui.View):
+class RoomPanelView(SafeView):
     def __init__(self, bot_ref: VoiceRoomBot, room_id: int = 0) -> None:
         super().__init__(timeout=None)
         self.bot_ref = bot_ref
@@ -1032,15 +1066,19 @@ class RoomPanelView(discord.ui.View):
             return
 
         music = bot.get_music_state(interaction.guild.id)
-        music.text_channel_id = interaction.channel_id
+        if not music.text_channel_id:
+            music.text_channel_id = interaction.channel_id
+        if not music.announce_channel_id:
+            music.announce_channel_id = interaction.channel_id
+        await interaction.response.defer(ephemeral=True, thinking=False)
         try:
             await music.connect_to(channel)
             await sync_room_panel(channel)
-            await safe_send(interaction, f"🔌 Бот подключился к {channel.mention} и готов к музыке.")
+            await interaction.followup.send(f"🔌 Бот подключился к {channel.mention} и готов к музыке.", ephemeral=True)
         except discord.ClientException as exc:
-            await safe_send(interaction, f"Не удалось подключиться: {exc}")
+            await interaction.followup.send(f"Не удалось подключиться: {exc}", ephemeral=True)
         except discord.Forbidden:
-            await safe_send(interaction, "Боту не хватает прав на вход и разговор в войсе.")
+            await interaction.followup.send("Боту не хватает прав на вход и разговор в войсе.", ephemeral=True)
 
     @discord.ui.button(label="Добавить", emoji="🎵", style=discord.ButtonStyle.primary, row=3, custom_id="room_music_add")
     async def music_add_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1113,6 +1151,54 @@ class RoomPanelView(discord.ui.View):
         await sync_room_panel(channel)
 
 
+    @discord.ui.button(label="Канал муз.", emoji="📢", style=discord.ButtonStyle.primary, row=4, custom_id="room_music_channel")
+    async def music_channel_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+            await safe_send(interaction, "Это работает только в текстовом канале сервера.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        music = bot.get_music_state(interaction.guild.id)
+        music.announce_channel_id = interaction.channel.id
+        if not music.text_channel_id:
+            music.text_channel_id = interaction.channel.id
+        await sync_room_panel(channel)
+        await safe_send(interaction, f"📢 Музыкальный канал установлен: {interaction.channel.mention}")
+
+    @discord.ui.button(label="Очередь", emoji="📜", style=discord.ButtonStyle.secondary, row=4, custom_id="room_music_queue")
+    async def music_queue_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not interaction.guild:
+            await safe_send(interaction, "Это работает только на сервере.")
+            return
+        music = bot.get_music_state(interaction.guild.id)
+        current = music.current.title if music.current else "Ничего не играет"
+        await safe_send(interaction, f"**Сейчас:** {current}\n\n{music.queue_preview(10)}")
+
+    @discord.ui.button(label="Loop", emoji="🔁", style=discord.ButtonStyle.secondary, row=4, custom_id="room_music_loop")
+    async def music_loop_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        if not interaction.guild:
+            await safe_send(interaction, "Это работает только на сервере.")
+            return
+        music = bot.get_music_state(interaction.guild.id)
+        music.is_looping = not music.is_looping
+        await sync_room_panel(channel)
+        await safe_send(interaction, f"🔁 Повтор трека: {'включён' if music.is_looping else 'выключен'}")
+
+
 @bot.event
 async def on_ready() -> None:
     log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
@@ -1161,6 +1247,17 @@ async def setup_voice_panel(interaction: discord.Interaction, channel: discord.T
     bot.control_channel_id = channel.id
     bot.save_state()
     await safe_send(interaction, f"Канал панелей установлен: {channel.mention}")
+
+
+@bot.tree.command(name="setup_music_channel", description="Установить отдельный канал для музыкальных уведомлений")
+@app_commands.describe(channel="Текстовый канал, куда бот будет отправлять что сейчас играет")
+async def setup_music_channel(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await safe_send(interaction, "Только администратор может менять музыкальный канал.")
+        return
+    music = bot.get_music_state(interaction.guild.id)
+    music.announce_channel_id = channel.id
+    await safe_send(interaction, f"Музыкальный канал установлен: {channel.mention}")
 
 
 @bot.tree.command(name="force_sync_voice_panels", description="Пересоздать панели активных войсов")
@@ -1411,6 +1508,55 @@ async def queue_command(ctx: commands.Context) -> None:
     await ctx.reply(embed=embed)
 
 
+@bot.command(name="nowplaying")
+async def nowplaying_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        return
+    music = bot.get_music_state(ctx.guild.id)
+    if not music.current:
+        await ctx.reply("Сейчас ничего не играет.")
+        return
+    await ctx.reply(f"Сейчас играет: **{music.current.title}** | `{human_duration(music.current.duration)}`")
+
+
+@bot.command(name="shuffle")
+async def shuffle_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        return
+    music = bot.get_music_state(ctx.guild.id)
+    if len(music.queue) < 2:
+        await ctx.reply("В очереди слишком мало треков для перемешивания.")
+        return
+    import random
+    items = list(music.queue)
+    random.shuffle(items)
+    music.queue = deque(items)
+    await ctx.reply("Очередь перемешана.")
+
+
+@bot.command(name="clear")
+async def clear_command(ctx: commands.Context) -> None:
+    if not ctx.guild:
+        return
+    music = bot.get_music_state(ctx.guild.id)
+    music.queue.clear()
+    await ctx.reply("Очередь очищена.")
+
+
+@bot.command(name="remove")
+async def remove_command(ctx: commands.Context, index: int) -> None:
+    if not ctx.guild:
+        return
+    music = bot.get_music_state(ctx.guild.id)
+    items = list(music.queue)
+    if not 1 <= index <= len(items):
+        await ctx.reply("Укажи существующий номер трека из очереди.")
+        return
+    removed = items.pop(index - 1)
+    music.queue = deque(items)
+    await ctx.reply(f"Удалён трек: **{removed.title}**")
+
+
 @bot.command(name="volume")
 async def volume_command(ctx: commands.Context, percent: int) -> None:
     if not ctx.guild:
@@ -1446,10 +1592,14 @@ async def musichelp_command(ctx: commands.Context) -> None:
             "`!pause` — пауза\n"
             "`!resume` — продолжить\n"
             "`!queue` — посмотреть очередь\n"
+            "`!nowplaying` — текущий трек\n"
+            "`!shuffle` — перемешать очередь\n"
+            "`!remove <номер>` — удалить трек\n"
+            "`!clear` — очистить очередь\n"
             "`!volume 1-200` — громкость\n"
             "`!loop` — повтор текущего трека"
         ),
-        color=0x111827,
+       color=0x111827,
     )
     await ctx.reply(embed=embed)
 
