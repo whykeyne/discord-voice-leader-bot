@@ -27,6 +27,8 @@ CONTROL_CHANNEL_NAME = os.getenv("CONTROL_CHANNEL_NAME", "voice-control")
 STATE_FILE = Path(os.getenv("STATE_FILE", "panel_state.json"))
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 DEFAULT_VOLUME = float(os.getenv("DEFAULT_VOLUME", "0.55") or 0.55)
+COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.txt")
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1185,10 +1187,21 @@ def extract_media(query: str) -> Tuple[Optional[Track], Optional[str]]:
         "extract_flat": False,
     }
 
+    cookie_path = Path(COOKIE_FILE)
+    if cookie_path.exists() and cookie_path.is_file():
+        ydl_opts["cookiefile"] = str(cookie_path)
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(query, download=False)
     except Exception as exc:
+        err_text = str(exc)
+        if "Sign in to confirm you’re not a bot" in err_text or "Use --cookies-from-browser or --cookies" in err_text:
+            return None, (
+                "YouTube запросил подтверждение. Добавь рядом с bot.py файл cookies.txt "
+                "или укажи переменную COOKIE_FILE с путём к cookies. "
+                f"Текущий путь: {COOKIE_FILE}"
+            )
         return None, f"Не удалось получить трек: {exc}"
 
     if not info:
