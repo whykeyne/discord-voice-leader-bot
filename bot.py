@@ -1178,7 +1178,6 @@ def extract_media(query: str) -> Tuple[Optional[Track], Optional[str]]:
         return None, "Не установлен yt-dlp. Установи пакет `yt-dlp`."
 
     ydl_opts = {
-        "format": "bestaudio/best",
         "noplaylist": True,
         "default_search": "ytsearch1",
         "quiet": True,
@@ -1213,7 +1212,22 @@ def extract_media(query: str) -> Tuple[Optional[Track], Optional[str]]:
     if not info:
         return None, "Не удалось прочитать ответ источника."
 
-    audio_url = info.get("url")
+    formats = info.get("formats") or []
+
+    def _fmt_score(fmt: dict) -> tuple:
+        audio_only = 1 if fmt.get("vcodec") == "none" else 0
+        has_audio = 1 if fmt.get("acodec") not in (None, "none") else 0
+        abr = float(fmt.get("abr") or fmt.get("tbr") or 0)
+        pref_ext = fmt.get("ext") in {"webm", "m4a", "mp4"}
+        protocol_penalty = 0 if fmt.get("protocol") not in {"m3u8_native", "m3u8"} else -1
+        return (audio_only, has_audio, pref_ext, protocol_penalty, abr)
+
+    selected = None
+    usable_formats = [f for f in formats if f.get("url") and f.get("acodec") not in (None, "none")]
+    if usable_formats:
+        selected = max(usable_formats, key=_fmt_score)
+
+    audio_url = (selected or info).get("url")
     webpage_url = info.get("webpage_url") or info.get("original_url") or query
     title = info.get("title") or "Unknown title"
     duration = int(info.get("duration") or 0)
