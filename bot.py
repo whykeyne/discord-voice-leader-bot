@@ -411,7 +411,7 @@ def make_room_embed(guild: discord.Guild, channel: discord.VoiceChannel | discor
     )
     embed.add_field(
         name="✦ Подключение бота",
-        value=f"{bot_voice_text}\n\n`Подключить` — зайти в войс\n`Добавить` — трек или ссылка",
+        value=f"{bot_voice_text}\n\n`Музыка` — подключить бота и открыть отдельную музыкальную панель",
         inline=False,
     )
     embed.add_field(name="✦ Участники", value=trunc(member_lines, 1024), inline=False)
@@ -421,7 +421,7 @@ def make_room_embed(guild: discord.Guild, channel: discord.VoiceChannel | discor
         value=(
             "`Лидер` • `Состав` • `Онлайн` • `Доступ`\n"
             "`Лимит` • `Обновить` • `Кик` • `Звук`\n"
-            "`Подключить` • `Добавить` • `Пауза` • `Скип` • `Стоп`\n`Канал муз.` • `Очередь` • `Loop`"
+            "`Музыка` — подключить бота и открыть муз-панель"
         ),
         inline=False,
     )
@@ -519,6 +519,25 @@ async def ensure_control_rights(interaction: discord.Interaction, room_channel: 
         return True
     await safe_send(interaction, "У тебя нет прав на управление этой комнатой.")
     return False
+
+
+async def ensure_music_panel_rights(interaction: discord.Interaction, guild_id: int) -> Optional[discord.Member]:
+    if not interaction.guild or interaction.guild.id != guild_id:
+        await safe_send(interaction, "Это работает только на нужном сервере.")
+        return None
+    member = interaction.user
+    if not isinstance(member, discord.Member):
+        await safe_send(interaction, "Это работает только на сервере.")
+        return None
+    music = bot.get_music_state(guild_id)
+    vc = music.get_voice_client()
+    if not vc or not vc.channel:
+        await safe_send(interaction, "Музыкальный бот сейчас не подключён к войсу.")
+        return None
+    if not member.voice or member.voice.channel != vc.channel:
+        await safe_send(interaction, f"Управлять музыкой могут только участники войса {vc.channel.mention}.")
+        return None
+    return member
 
 
 def get_music_announce_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
@@ -1043,29 +1062,16 @@ class MusicPanelView(SafeView):
     def _guild(self) -> Optional[discord.Guild]:
         return self.bot_ref.get_guild(self.guild_id)
 
-    async def _member_ready(self, interaction: discord.Interaction) -> Optional[discord.Member]:
-        if not interaction.guild or interaction.guild.id != self.guild_id:
-            await safe_send(interaction, "Это работает только на нужном сервере.")
-            return None
-        member = interaction.user
-        if not isinstance(member, discord.Member):
-            await safe_send(interaction, "Это работает только на сервере.")
-            return None
-        if not member.voice or not member.voice.channel:
-            await safe_send(interaction, "Сначала зайди в голосовой канал.")
-            return None
-        return member
-
     @discord.ui.button(label="Добавить", emoji="🎵", style=discord.ButtonStyle.primary, row=0, custom_id="music_panel_add")
     async def add_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        member = await self._member_ready(interaction)
+        member = await ensure_music_panel_rights(interaction, self.guild_id)
         if not member:
             return
         await interaction.response.send_modal(MusicPanelAddModal(self.guild_id))
 
     @discord.ui.button(label="Пауза", emoji="⏯️", style=discord.ButtonStyle.secondary, row=0, custom_id="music_panel_pause")
     async def pause_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        member = await self._member_ready(interaction)
+        member = await ensure_music_panel_rights(interaction, self.guild_id)
         if not member:
             return
         music = bot.get_music_state(self.guild_id)
@@ -1082,7 +1088,7 @@ class MusicPanelView(SafeView):
 
     @discord.ui.button(label="Скип", emoji="⏭️", style=discord.ButtonStyle.secondary, row=0, custom_id="music_panel_skip")
     async def skip_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        member = await self._member_ready(interaction)
+        member = await ensure_music_panel_rights(interaction, self.guild_id)
         if not member:
             return
         music = bot.get_music_state(self.guild_id)
@@ -1094,7 +1100,7 @@ class MusicPanelView(SafeView):
 
     @discord.ui.button(label="Стоп", emoji="⏹️", style=discord.ButtonStyle.danger, row=0, custom_id="music_panel_stop")
     async def stop_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        member = await self._member_ready(interaction)
+        member = await ensure_music_panel_rights(interaction, self.guild_id)
         if not member:
             return
         music = bot.get_music_state(self.guild_id)
@@ -1104,9 +1110,8 @@ class MusicPanelView(SafeView):
 
     @discord.ui.button(label="Очередь", emoji="📜", style=discord.ButtonStyle.secondary, row=1, custom_id="music_panel_queue")
     async def queue_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        guild = self._guild()
-        if not guild:
-            await safe_send(interaction, "Сервер недоступен.")
+        member = await ensure_music_panel_rights(interaction, self.guild_id)
+        if not member:
             return
         music = bot.get_music_state(self.guild_id)
         current = music.current.title if music.current else "Ничего не играет"
@@ -1114,7 +1119,7 @@ class MusicPanelView(SafeView):
 
     @discord.ui.button(label="Loop", emoji="🔁", style=discord.ButtonStyle.secondary, row=1, custom_id="music_panel_loop")
     async def loop_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        member = await self._member_ready(interaction)
+        member = await ensure_music_panel_rights(interaction, self.guild_id)
         if not member:
             return
         music = bot.get_music_state(self.guild_id)
@@ -1128,6 +1133,7 @@ class RoomPanelView(SafeView):
         super().__init__(timeout=None)
         self.bot_ref = bot_ref
         self.room_id = room_id
+        self.add_item(ActionPicker(bot_ref, room_id) if room_id else PlaceholderActionPicker())
 
     def _resolve_room_id(self, interaction: discord.Interaction) -> Optional[int]:
         if self.room_id:
@@ -1145,7 +1151,97 @@ class RoomPanelView(SafeView):
         channel = self.bot_ref.get_channel(room_id) if room_id else None
         return channel if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)) else None
 
-    @discord.ui.button(label="Музыка", emoji="🎵", style=discord.ButtonStyle.primary, row=0, custom_id="room_music_only")
+    @discord.ui.button(label="Лидер", emoji="👑", style=discord.ButtonStyle.primary, row=1, custom_id="room_leader")
+    async def leader_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        await interaction.response.send_message(
+            "Выбери нового лидера:",
+            ephemeral=True,
+            view=MemberActionView(bot, channel.id, "leader", interaction.user.id),
+        )
+
+    @discord.ui.button(label="Состав", emoji="👥", style=discord.ButtonStyle.secondary, row=1, custom_id="room_user_info")
+    async def user_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        humans = [m.mention for m in channel.members if not m.bot]
+        await safe_send(interaction, "\n".join(humans) or "Пусто")
+
+    @discord.ui.button(label="Онлайн", emoji="📶", style=discord.ButtonStyle.secondary, row=1, custom_id="room_users")
+    async def users_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        await safe_send(interaction, f"{EMOJI['users']} Сейчас в комнате: **{len([m for m in channel.members if not m.bot])}**")
+
+    @discord.ui.button(label="Доступ", emoji="🔐", style=discord.ButtonStyle.secondary, row=1, custom_id="room_lock_toggle")
+    async def lock_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        overwrite = channel.overwrites_for(channel.guild.default_role)
+        currently_locked = overwrite.connect is False
+        overwrite.connect = None if currently_locked else False
+        try:
+            await channel.set_permissions(channel.guild.default_role, overwrite=overwrite)
+            await sync_room_panel(channel)
+            await safe_send(interaction, f"{EMOJI['unlock']} Комната открыта." if currently_locked else f"{EMOJI['lock']} Комната закрыта.")
+        except discord.Forbidden:
+            await safe_send(interaction, "Боту не хватает права Manage Channels / Manage Roles.")
+        except discord.HTTPException:
+            await safe_send(interaction, "Не удалось изменить доступ к комнате.")
+
+    @discord.ui.button(label="Лимит", emoji="🎚️", style=discord.ButtonStyle.secondary, row=2, custom_id="room_limit")
+    async def settings_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        await interaction.response.send_modal(LimitRoomModal(channel.id, channel.user_limit))
+
+    @discord.ui.button(label="Обновить", emoji="✨", style=discord.ButtonStyle.secondary, row=2, custom_id="room_refresh")
+    async def sparkle_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        await sync_room_panel(channel)
+        await safe_send(interaction, f"{EMOJI['sparkle']} Панель обновлена.")
+
+    @discord.ui.button(label="Кик", emoji="🚪", style=discord.ButtonStyle.danger, row=2, custom_id="room_kick")
+    async def kick_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        await interaction.response.send_message("Выбери участника:", ephemeral=True, view=MemberActionView(bot, channel.id, "kick", interaction.user.id))
+
+    @discord.ui.button(label="Звук", emoji="🔊", style=discord.ButtonStyle.success, row=2, custom_id="room_sound_restore")
+    async def sound_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        channel = self._get_channel(interaction)
+        if not channel:
+            await safe_send(interaction, "Комната уже недоступна.")
+            return
+        if not await ensure_control_rights(interaction, channel):
+            return
+        await interaction.response.send_message("Выбери участника:", ephemeral=True, view=MemberActionView(bot, channel.id, "undeafen", interaction.user.id))
+
+    @discord.ui.button(label="Музыка", emoji="🎵", style=discord.ButtonStyle.primary, row=3, custom_id="room_music_only")
     async def music_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         channel = self._get_channel(interaction)
         if not channel:
